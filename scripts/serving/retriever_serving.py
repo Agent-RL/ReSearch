@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List, Tuple, Union
 import asyncio
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 from flashrag.config import Config
 from flashrag.utils import get_retriever
@@ -13,6 +14,7 @@ app = FastAPI()
 retriever_list = []
 available_retrievers = deque()
 retriever_semaphore = None
+retriever_lock = None
 
 def init_retriever(args):
     global retriever_semaphore
@@ -24,6 +26,8 @@ def init_retriever(args):
         available_retrievers.append(i)
     # create a semaphore to limit the number of retrievers that can be used concurrently
     retriever_semaphore = asyncio.Semaphore(args.num_retriever)
+    global retriever_lock
+    retriever_lock = asyncio.Lock()
 
 @app.get("/health")
 async def health_check():
@@ -63,16 +67,28 @@ async def search(request: QueryRequest):
         )
 
     async with retriever_semaphore:
-        retriever_idx = available_retrievers.popleft()
+        async with retriever_lock:
+            retriever_idx = available_retrievers.popleft()
         try:
-            if return_score:
-                results, scores = retriever_list[retriever_idx].search(query, top_n, return_score)
-                return [Document(id=result['id'], contents=result['contents']) for result in results], scores
-            else:
-                results = retriever_list[retriever_idx].search(query, top_n, return_score)
-                return [Document(id=result['id'], contents=result['contents']) for result in results]
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                if return_score:
+                    results, scores = await loop.run_in_executor(
+                        executor,
+                        retriever_list[retriever_idx].search,
+                        query, top_n, return_score
+                    )
+                    return [Document(id=result['id'], contents=result['contents']) for result in results], scores
+                else:
+                    results = await loop.run_in_executor(
+                        executor,
+                        retriever_list[retriever_idx].search,
+                        query, top_n, return_score
+                    )
+                    return [Document(id=result['id'], contents=result['contents']) for result in results]
         finally:
-            available_retrievers.append(retriever_idx)
+            async with retriever_lock:
+                available_retrievers.append(retriever_idx)
 
 @app.post("/batch_search", response_model=Union[List[List[Document]], Tuple[List[List[Document]], List[List[float]]]])
 async def batch_search(request: BatchQueryRequest):
@@ -81,16 +97,28 @@ async def batch_search(request: BatchQueryRequest):
     return_score = request.return_score
 
     async with retriever_semaphore:
-        retriever_idx = available_retrievers.popleft()
+        async with retriever_lock:
+            retriever_idx = available_retrievers.popleft()
         try:
-            if return_score:
-                results, scores = retriever_list[retriever_idx].batch_search(query, top_n, return_score)
-                return [[Document(id=result['id'], contents=result['contents']) for result in results[i]] for i in range(len(results))], scores
-            else:
-                results = retriever_list[retriever_idx].batch_search(query, top_n, return_score)
-                return [[Document(id=result['id'], contents=result['contents']) for result in results[i]] for i in range(len(results))]
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                if return_score:
+                    results, scores = await loop.run_in_executor(
+                        executor,
+                        retriever_list[retriever_idx].batch_search,
+                        query, top_n, return_score
+                    )
+                    return [[Document(id=result['id'], contents=result['contents']) for result in results[i]] for i in range(len(results))], scores
+                else:
+                    results = await loop.run_in_executor(
+                        executor,
+                        retriever_list[retriever_idx].batch_search,
+                        query, top_n, return_score
+                    )
+                    return [[Document(id=result['id'], contents=result['contents']) for result in results[i]] for i in range(len(results))]
         finally:
-            available_retrievers.append(retriever_idx)
+            async with retriever_lock:
+                available_retrievers.append(retriever_idx)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
